@@ -494,6 +494,70 @@ def quick_fingerprint(path: str, size: int) -> str:
     return h.hexdigest()
 
 
+# ---------- Zone (area) & discipline auto-classification ----------
+ZONE_PATTERNS = [
+    ("Site / External", r"\bSITE\b|EXTERNAL|LANDSCAPE|\bEXT\b|\bINFRA"),
+    ("Roof", r"\bROOF\b|\bRF\b|\bRFL\b"),
+    ("Basement", r"BASEMENT|\bBSMT\b|\bB[1-4]\b|\bB0[1-4]\b|\bLB[1-4]\b|\bB[1-4]F\b|\bBF\b|\bLEVEL\s*-\s*[1-4]\b"),
+    ("Ground Floor", r"GROUND|\bGF\b|\bG\.F\.?|\bGFL\b|\bL00\b|\bLG\b|\bLEVEL\s*0\b|\bLVL\s*0\b"),
+    ("Mezzanine", r"MEZZ|\bMZ\b"),
+    ("First Floor", r"\bFIRST\b|\b1ST\b|\bFF\b|\bL01\b|\bF1\b|\bLEVEL\s*0?1\b|\bLVL\s*0?1\b"),
+    ("Second Floor", r"\bSECOND\b|\b2ND\b|\bL02\b|\bF2\b|\bLEVEL\s*0?2\b|\bLVL\s*0?2\b"),
+    ("Third Floor", r"\bTHIRD\b|\b3RD\b|\bL03\b|\bF3\b|\bLEVEL\s*0?3\b|\bLVL\s*0?3\b"),
+    ("Typical Floor", r"TYPICAL|\bTYP\b"),
+]
+ZONE_PATTERNS = [(name, re.compile(pat)) for name, pat in ZONE_PATTERNS]
+GENERIC_LEVEL_REGEX = re.compile(r"\b(\d{1,2})(?:ST|ND|RD|TH)\s*FLOOR\b|\bL(\d{2})\b|\bLEVEL\s*(\d{1,2})\b|\bLVL\s*(\d{1,2})\b")
+
+DISCIPLINE_PATTERNS = [
+    ("Lighting", r"LIGHTING|\bLTG\b|\bLIGHT\b|LUMINAIRE|\bLGT\b|\bLT\b"),
+    ("Power", r"\bPOWER\b|\bPWR\b|SOCKET|\bSP\b|SMALL\s*POWER|\bPWS\b"),
+    ("Fire Alarm", r"FIRE\s*ALARM|\bFA\b|\bFAS\b|DETECTION|SMOKE"),
+    ("Fire Fighting", r"FIRE\s*FIGHT|\bFFS\b|SPRINKLER|HYDRANT|\bFP\b|FIRE\s*PROTECTION|\bFM200\b|SUPPRESSION"),
+    ("HVAC", r"HVAC|\bDUCT|CHILLED|\bCHW\b|VENTILATION|\bVRF\b|\bFCU\b|\bAHU\b|AIR\s*COND|\bAC\b|MECHANICAL|\bMECH\b"),
+    ("Plumbing / Drainage", r"PLUMB|DRAIN|SANITARY|WATER\s*SUPPLY|\bPLB\b|\bDWS\b|\bSWR\b|SEWER|\bDR\b|\bPL\b"),
+    ("ELV / Low Current", r"\bELV\b|LOW\s*CURRENT|CCTV|\bDATA\b|TELECOM|\bTEL\b|ACCESS\s*CONTROL|\bBMS\b|PUBLIC\s*ADDRESS|\bPA\b|\bLC\b|STRUCTURED\s*CABL|\bICT\b|\bAV\b|MATV|IPTV"),
+    ("Earthing / Lightning", r"EARTH|LIGHTNING|GROUNDING|\bLPS\b|\bERT\b"),
+    ("Single Line / Schematics", r"\bSLD\b|SINGLE\s*LINE|SCHEMATIC|RISER|LOAD\s*SCHEDULE|PANEL\s*SCHEDULE|\bDB\s*SCHEDULE"),
+    ("Containment / Cable Tray", r"CABLE\s*TRAY|TRAY|CONTAINMENT|TRUNK|CONDUIT|\bCT\b"),
+    ("Electrical (general)", r"ELECTRICAL|\bELEC\b|\bELE\b|\bEL\b|\bE-\w"),
+    ("Architectural", r"ARCHITECT|\bARCH\b|\bAR-\w"),
+    ("Structural", r"STRUCT|\bSTR\b|\bST-\w"),
+    ("Civil", r"\bCIVIL\b|\bCV\b|\bC-\w"),
+]
+DISCIPLINE_PATTERNS = [(name, re.compile(pat)) for name, pat in DISCIPLINE_PATTERNS]
+
+
+def _classify(patterns, texts: list[str], generic=None) -> str | None:
+    """Return the first pattern name found; texts are tried in priority order."""
+    for text in texts:
+        if not text:
+            continue
+        t = text.upper()
+        for name, rx in patterns:
+            if rx.search(t):
+                return name
+        if generic is not None:
+            m = generic.search(t)
+            if m:
+                n = next(g for g in m.groups() if g)
+                return f"Level {int(n):02d}"
+    return None
+
+
+def classify_zone(rel_dir: str, file_name: str, title: str, dwg_no: str) -> str:
+    # Deepest folder first (the user's own filing), then file name, drawing number, title.
+    parts = [p for p in rel_dir.replace("\\", "/").split("/") if p and p != "."]
+    texts = list(reversed(parts)) + [os.path.splitext(file_name)[0], dwg_no, title]
+    return _classify(ZONE_PATTERNS, texts, GENERIC_LEVEL_REGEX) or "Unassigned"
+
+
+def classify_discipline(rel_dir: str, file_name: str, title: str, dwg_no: str) -> str:
+    parts = [p for p in rel_dir.replace("\\", "/").split("/") if p and p != "."]
+    texts = list(reversed(parts)) + [os.path.splitext(file_name)[0], dwg_no, title]
+    return _classify(DISCIPLINE_PATTERNS, texts) or "Unassigned"
+
+
 # ==========================================
 # 3. Project folder scanner
 # ==========================================
@@ -717,6 +781,20 @@ def load_documents(version: int) -> pd.DataFrame:
     df["size_mb"] = (df["file_size"] / 1_048_576).round(2)
     df["project"] = df["root_folder"].map(lambda p: os.path.basename(p.rstrip("\\/")) or p)
 
+    def _rel_dir(row):
+        try:
+            rel = os.path.relpath(os.path.dirname(row["file_path"]), row["root_folder"])
+        except ValueError:
+            rel = "."
+        return "" if rel == "." else rel.replace("\\", "/")
+
+    df["rel_dir"] = df.apply(_rel_dir, axis=1)
+    df["tree_path"] = np.where(df["rel_dir"] == "", df["project"], df["project"] + "/" + df["rel_dir"])
+    df["zone"] = [classify_zone(r, f, t, d) for r, f, t, d in
+                  zip(df["rel_dir"], df["file_name"], df["title"], df["dwg_no"])]
+    df["discipline"] = [classify_discipline(r, f, t, d) for r, f, t, d in
+                        zip(df["rel_dir"], df["file_name"], df["title"], df["dwg_no"])]
+
     df = df.sort_values(
         by=["has_dwg_no", "dwg_no", "rev_tier", "rev_num", "rev_suffix", "last_modified"],
         ascending=[False, True, False, False, False, False],
@@ -744,7 +822,7 @@ def load_documents(version: int) -> pd.DataFrame:
 
     df["_search"] = (
         df["file_name"] + " " + df["dwg_no"] + " " + df["title"] + " " + df["folder_name"]
-        + " " + df["ref_dwgs"] + " REV " + df["revision"]
+        + " " + df["ref_dwgs"] + " REV " + df["revision"] + " " + df["zone"] + " " + df["discipline"]
     ).map(_norm_search)
     return df
 
@@ -760,19 +838,19 @@ def apply_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
 
 
 def build_excel_register(df: pd.DataFrame) -> bytes:
-    cols = ["status", "dwg_no", "revision", "title", "file_type", "issue_date", "project",
-            "folder_name", "file_name", "modified", "size_mb", "ref_dwgs", "file_path"]
+    cols = ["status", "dwg_no", "revision", "title", "zone", "discipline", "file_type", "issue_date",
+            "project", "folder_name", "file_name", "modified", "size_mb", "ref_dwgs", "file_path"]
     out = df[cols].copy()
     out["modified"] = out["modified"].dt.strftime("%Y-%m-%d %H:%M")
-    out.columns = ["Status", "Drawing No", "Rev", "Title", "Type", "Issue Date", "Project",
-                   "Folder", "File Name", "Modified", "Size (MB)", "Referenced Drawings", "Path"]
+    out.columns = ["Status", "Drawing No", "Rev", "Title", "Zone", "Discipline", "Type", "Issue Date",
+                   "Project", "Folder", "File Name", "Modified", "Size (MB)", "Referenced Drawings", "Path"]
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="Drawing Register")
         ws = writer.sheets["Drawing Register"]
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
-        widths = [12, 24, 7, 45, 7, 12, 18, 30, 40, 17, 10, 30, 70]
+        widths = [12, 24, 7, 45, 14, 18, 7, 12, 18, 30, 40, 17, 10, 30, 70]
         for i, wdt in enumerate(widths, start=1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = wdt
     return buf.getvalue()
@@ -825,6 +903,38 @@ TYPE_ICON = {
     "CSV": "📊", "DOCX": "📝", "DOC": "📝",
 }
 STATUS_BADGE = {"Current": "🟢 Current", "Superseded": "🟠 Superseded", "Unclassified": "⚪ Unclassified"}
+TABLE_COLUMN_CONFIG = {
+    "status": st.column_config.TextColumn("Status", width="small"),
+    "dwg_no": st.column_config.TextColumn("Drawing No", width="medium"),
+    "revision": st.column_config.TextColumn("Rev", width="small"),
+    "title": st.column_config.TextColumn("Title", width="large"),
+    "zone": st.column_config.TextColumn("Zone", width="small"),
+    "discipline": st.column_config.TextColumn("Discipline", width="small"),
+    "file_type": st.column_config.TextColumn("Type", width="small"),
+    "issue_date": st.column_config.TextColumn("Issue date", width="small"),
+    "project": st.column_config.TextColumn("Project", width="small"),
+    "folder_name": st.column_config.TextColumn("Folder", width="medium"),
+    "file_name": st.column_config.TextColumn("File", width="medium"),
+    "modified": st.column_config.DatetimeColumn("Modified", format="YYYY-MM-DD HH:mm"),
+    "size_mb": st.column_config.NumberColumn("MB", format="%.2f"),
+    "is_duplicate": st.column_config.CheckboxColumn("Dup"),
+    "is_conflict": st.column_config.CheckboxColumn("Conflict"),
+    "file_path": st.column_config.TextColumn("Path", width="large"),
+}
+TABLE_COLUMNS = ["status", "dwg_no", "revision", "title", "zone", "discipline", "file_type", "issue_date",
+                 "folder_name", "file_name", "modified", "size_mb", "is_duplicate", "is_conflict", "file_path"]
+
+
+def human_size(num_bytes) -> str:
+    try:
+        n = float(num_bytes)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
 
 
 def bump_data_version() -> None:
@@ -832,14 +942,169 @@ def bump_data_version() -> None:
     load_documents.clear()
 
 
+def render_file_list(page_df: pd.DataFrame, view_mode: str, key_prefix: str) -> None:
+    """Render a slice of the register either as a table or as compact cards with Open buttons."""
+    if page_df.empty:
+        st.caption("No files here.")
+        return
+    if view_mode.startswith("Table"):
+        st.dataframe(
+            page_df[TABLE_COLUMNS], hide_index=True, column_config=TABLE_COLUMN_CONFIG,
+            height=min(900, 42 + 35 * len(page_df)), **WIDE_DF,
+        )
+        return
+
+    for row in page_df.itertuples(index=False):
+        with st.container(border=True):
+            a, b, c, d, e, g = st.columns([3.4, 1.7, 0.8, 1.4, 1.7, 1.5])
+            icon = TYPE_ICON.get(row.file_type, "📄")
+            a.markdown(f"{icon} **{row.title}**")
+            a.caption(f"{row.file_name}  ·  📍 {row.folder_name}")
+            b.markdown(f"**{row.dwg_no}**")
+            b.caption(f"{row.zone} · {row.discipline}")
+            c.markdown(f"Rev **{row.revision}**")
+            d.markdown(STATUS_BADGE.get(row.status, row.status))
+            flags = []
+            if row.is_duplicate:
+                flags.append("🔁 duplicate")
+            if row.is_conflict:
+                flags.append("⚠️ conflict")
+            d.caption(" · ".join(flags) if flags else f"📅 {row.issue_date}")
+            e.caption(f"{human_size(row.file_size)} · modified {row.modified:%Y-%m-%d}" if pd.notna(row.modified)
+                      else human_size(row.file_size))
+            if row.ref_dwgs:
+                e.caption(f"refs: {row.ref_dwgs}")
+            with g:
+                if st.button("📂 Open file", key=f"{key_prefix}_open_{row.id}", help=row.file_path, **WIDE_BTN):
+                    open_file(row.file_path)
+                if st.button("🗂️ Show in folder", key=f"{key_prefix}_folder_{row.id}",
+                             help=os.path.dirname(row.file_path), **WIDE_BTN):
+                    open_folder(row.file_path)
+
+
+def paginate(df_slice: pd.DataFrame, items_per_page: int, state_key: str, label: str = "") -> pd.DataFrame:
+    """Pager widget; keeps its page number in session_state[state_key]. Returns the current page."""
+    total = len(df_slice)
+    total_pages = max(1, -(-total // items_per_page))
+    page = min(max(1, st.session_state.get(state_key, 1)), total_pages)
+    if total_pages > 1:
+        p1, p2, p3, p4 = st.columns([1, 4, 1.4, 1])
+        if p1.button("◀ Prev", key=f"{state_key}_prev", disabled=page <= 1, **WIDE_BTN):
+            page -= 1
+        p2.caption(f"{label}{total:,} files · page {page} / {total_pages}")
+        page = int(p3.number_input("Page", min_value=1, max_value=total_pages, value=page, step=1,
+                                   key=f"{state_key}_num", label_visibility="collapsed"))
+        if p4.button("Next ▶", key=f"{state_key}_next", disabled=page >= total_pages, **WIDE_BTN):
+            page += 1
+    else:
+        st.caption(f"{label}{total:,} files")
+    page = min(max(1, page), total_pages)
+    st.session_state[state_key] = page
+    start = (page - 1) * items_per_page
+    return df_slice.iloc[start:start + items_per_page]
+
+
+def render_grouped(df_slice: pd.DataFrame, group_cols: list[str], view_mode: str, key_prefix: str,
+                   items_per_page: int) -> None:
+    """Show files split into one expander per group (zone, discipline, folder ...)."""
+    if df_slice.empty:
+        st.warning("No files match the current filters.")
+        return
+    first, rest = group_cols[0], group_cols[1:]
+    keys = df_slice[first].unique().tolist()
+    keys = sorted(keys, key=lambda k: (k == "Unassigned", str(k)))
+    for i, key in enumerate(keys):
+        sub = df_slice[df_slice[first] == key]
+        with st.expander(f"**{key}**  ·  {len(sub):,} files", expanded=len(keys) <= 6):
+            if rest:
+                render_grouped(sub, rest, view_mode, f"{key_prefix}_{i}", items_per_page)
+            else:
+                page = paginate(sub, items_per_page, f"{key_prefix}_{i}_page") if len(sub) > items_per_page else sub
+                render_file_list(page, view_mode, f"{key_prefix}_{i}")
+
+
+def render_browse_tab(df: pd.DataFrame, view_mode: str, items_per_page: int) -> None:
+    """Explorer-like navigation: project ▸ building ▸ floor ▸ discipline ▸ files."""
+    st.session_state.setdefault("browse_path", "")
+    current = st.session_state["browse_path"]
+
+    all_paths = df["tree_path"].unique().tolist()
+    if current and not any(p == current or p.startswith(current + "/") for p in all_paths):
+        current = st.session_state["browse_path"] = ""
+
+    # ----- breadcrumb -----
+    crumbs = [c for c in current.split("/") if c]
+    widths = [1.3] + [max(1.6, min(4.0, 0.9 + len(c) * 0.16)) for c in crumbs]
+    cols = st.columns(widths + [max(0.5, 12 - sum(widths))])
+    if cols[0].button("🏠 Home", key="bc_home", disabled=current == "", **WIDE_BTN):
+        st.session_state["browse_path"] = ""
+        st.rerun()
+    for i, crumb in enumerate(crumbs):
+        target = "/".join(crumbs[: i + 1])
+        if cols[i + 1].button(f"📁 {crumb}", key=f"bc_{i}", disabled=target == current, **WIDE_BTN):
+            st.session_state["browse_path"] = target
+            st.rerun()
+
+    # ----- sub folders -----
+    prefix = current + "/" if current else ""
+    children: dict[str, int] = {}
+    in_scope = df[(df["tree_path"] == current) | df["tree_path"].str.startswith(prefix)] if current else df
+    for tp, n in in_scope["tree_path"].value_counts().items():
+        remainder = tp[len(prefix):] if current else tp
+        if not remainder:
+            continue
+        child = remainder.split("/")[0]
+        children[child] = children.get(child, 0) + int(n)
+
+    direct = in_scope[in_scope["tree_path"] == current] if current else df[df["tree_path"] == ""]
+    opt_cols = st.columns([1.5, 1.3, 1.7, 3.5])
+    include_sub = opt_cols[0].toggle("Include sub-folders", value=False, key="browse_incl",
+                                     help="Show every file under this folder, grouped by sub-folder.")
+    latest_only = opt_cols[1].toggle("Latest rev only", value=True, key="browse_latest")
+    group_mode = opt_cols[2].selectbox("Group files by:", options=["Folder", "Zone", "Discipline", "Zone → Discipline"],
+                                       key="browse_group", label_visibility="collapsed")
+    if current:
+        root_row = in_scope.iloc[0]
+        abs_folder = os.path.join(root_row["root_folder"], root_row["rel_dir"]) if root_row["rel_dir"] else root_row["root_folder"]
+        if opt_cols[3].button("🗂️ Open this folder in Explorer", key="open_browse_folder"):
+            open_folder(os.path.join(abs_folder, "_"))
+
+    if children:
+        st.markdown("**Folders**")
+        grid = st.columns(4)
+        for i, (name, n) in enumerate(sorted(children.items(), key=lambda kv: kv[0].lower())):
+            if grid[i % 4].button(f"📁 {name}  ·  {n:,}", key=f"child_{i}", **WIDE_BTN):
+                st.session_state["browse_path"] = prefix + name
+                st.rerun()
+
+    st.markdown("**Files**")
+    files = in_scope if include_sub else direct
+    if latest_only:
+        files = files[files["status"] != "Superseded"]
+    files = files.sort_values(["dwg_no", "rev_tier", "rev_num", "rev_suffix", "file_name"],
+                              ascending=[True, False, False, False, True])
+
+    group_cols = {"Folder": ["folder_name"], "Zone": ["zone"], "Discipline": ["discipline"],
+                  "Zone → Discipline": ["zone", "discipline"]}[group_mode]
+    if include_sub and (len(files) > items_per_page or group_mode != "Folder" or files["folder_name"].nunique() > 1):
+        render_grouped(files, group_cols, view_mode, "browse", items_per_page)
+    elif group_mode != "Folder" and not files.empty:
+        render_grouped(files, group_cols, view_mode, "browse", items_per_page)
+    else:
+        page = paginate(files, items_per_page, "browse_page") if len(files) > items_per_page else files
+        if files.empty and not children:
+            st.caption("Empty folder.")
+        else:
+            render_file_list(page, view_mode, "browse")
+
+
 def main() -> None:
     st.set_page_config(page_title="Drawing Control System", page_icon="🏗️", layout="wide")
     init_db()
     st.session_state.setdefault("data_version", 0)
-    st.session_state.setdefault("page", 1)
     st.session_state.setdefault("filter_sig", None)
 
-    st.title("🏗️ " + APP_TITLE)
+    st.title("🏗️ Drawing & Document Control")
 
     # ---------- Sidebar ----------
     with st.sidebar:
@@ -868,7 +1133,6 @@ def main() -> None:
                 stat_txt.empty()
                 prog_bar.empty()
                 st.session_state["last_scan"] = stats
-                st.session_state["page"] = 1
                 bump_data_version()
                 st.rerun()
             else:
@@ -887,8 +1151,8 @@ def main() -> None:
 
         st.divider()
         st.subheader("🛠️ Display")
-        items_per_page = st.selectbox("Rows per page:", options=[25, 50, 100, 250, 500], index=1)
         view_mode = st.radio("View mode:", options=["Cards (with Open buttons)", "Table (fast scrolling)"])
+        items_per_page = st.selectbox("Rows per page:", options=[25, 50, 100, 250, 500], index=1)
         st.caption("Open buttons work when this app runs on the same PC as the browser.")
 
         st.divider()
@@ -898,7 +1162,7 @@ def main() -> None:
         if st.button("🗑️ Reset database", disabled=not confirm_reset, **WIDE_BTN):
             clear_db()
             st.session_state.pop("last_scan", None)
-            st.session_state["page"] = 1
+            st.session_state["browse_path"] = ""
             bump_data_version()
             st.warning("Database cleared.")
             st.rerun()
@@ -913,192 +1177,141 @@ def main() -> None:
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Indexed files", f"{len(df):,}")
     m2.metric("Drawing numbers", f"{df.loc[df['has_dwg_no'], 'dwg_no'].nunique():,}")
-    m3.metric("PDF", f"{(df['file_type'] == 'PDF').sum():,}")
-    m4.metric("DWG / DXF", f"{df['file_type'].isin(['DWG', 'DXF']).sum():,}")
-    m5.metric("Excel / Word", f"{df['file_type'].isin(['XLSX', 'XLS', 'XLSM', 'CSV', 'DOCX', 'DOC']).sum():,}")
-    m6.metric("Superseded", f"{(df['status'] == 'Superseded').sum():,}",
+    m3.metric("Current drawings", f"{(df['status'] == 'Current').sum():,}")
+    m4.metric("Superseded", f"{(df['status'] == 'Superseded').sum():,}",
               help="Older revisions of a drawing number that has a newer revision indexed.")
+    m5.metric("Zones", f"{df.loc[df['zone'] != 'Unassigned', 'zone'].nunique():,}")
+    m6.metric("Disciplines", f"{df.loc[df['discipline'] != 'Unassigned', 'discipline'].nunique():,}")
 
-    st.divider()
+    tab_browse, tab_register, tab_issues, tab_stats = st.tabs(
+        ["📂 Browse by folder", "📋 Register & filters", "⚠️ Issues", "📊 Statistics"]
+    )
 
-    # ---------- Filters ----------
-    c1, c2, c3, c4, c5, c6 = st.columns([2.6, 1.4, 1.7, 1.1, 1.1, 1.3])
-    with c1:
-        search_query = st.text_input("🔎 Search (e.g. 'GF Lighting', 'E LTG 02', 'Rev 03'):", key="search")
-    with c2:
-        projects = sorted(df["project"].unique().tolist())
-        selected_projects = st.multiselect("🏢 Project:", options=projects, placeholder="All projects")
-    with c3:
-        folders = sorted(df["folder_name"].unique().tolist())
-        selected_folders = st.multiselect("📍 Location / folder:", options=folders, placeholder="All folders")
-    with c4:
-        types = sorted(df["file_type"].unique().tolist())
-        selected_types = st.multiselect("📄 Type:", options=types, placeholder="All types")
-    with c5:
-        revs = sorted(df["revision"].unique().tolist(), key=revision_sort_rank, reverse=True)
-        selected_revs = st.multiselect("🔢 Revision:", options=revs, placeholder="All revs")
-    with c6:
-        status_choice = st.selectbox("✅ Status:", options=["All", "Current (latest rev)", "Superseded", "Unclassified"],
-                                     key="status")
-
-    s1, s2, s3 = st.columns([1.6, 1.2, 3])
-    with s1:
-        sort_by = st.selectbox("Sort by:", options=["Drawing No", "Revision (high → low)", "Last modified (newest)",
-                                                    "Issue date (newest)", "File name", "Folder"])
-    with s2:
-        extra = st.multiselect("Flags:", options=["Duplicates only", "Revision conflicts only", "Has issue date"],
-                               placeholder="No extra filter")
-
-    filtered = df
-    if selected_projects:
-        filtered = filtered[filtered["project"].isin(selected_projects)]
-    if selected_folders:
-        filtered = filtered[filtered["folder_name"].isin(selected_folders)]
-    if selected_types:
-        filtered = filtered[filtered["file_type"].isin(selected_types)]
-    if selected_revs:
-        filtered = filtered[filtered["revision"].isin(selected_revs)]
-    if status_choice == "Current (latest rev)":
-        filtered = filtered[filtered["status"] == "Current"]
-    elif status_choice == "Superseded":
-        filtered = filtered[filtered["status"] == "Superseded"]
-    elif status_choice == "Unclassified":
-        filtered = filtered[filtered["status"] == "Unclassified"]
-    if "Duplicates only" in extra:
-        filtered = filtered[filtered["is_duplicate"]]
-    if "Revision conflicts only" in extra:
-        filtered = filtered[filtered["is_conflict"]]
-    if "Has issue date" in extra:
-        filtered = filtered[filtered["issue_date"] != NO_DWG]
-    filtered = apply_search(filtered, search_query)
-
-    sort_map = {
-        "Drawing No": (["has_dwg_no", "dwg_no", "rev_tier", "rev_num", "rev_suffix"], [False, True, False, False, False]),
-        "Revision (high → low)": (["rev_tier", "rev_num", "rev_suffix", "dwg_no"], [False, False, False, True]),
-        "Last modified (newest)": (["last_modified"], [False]),
-        "Issue date (newest)": (["issue_date"], [False]),
-        "File name": (["file_name"], [True]),
-        "Folder": (["folder_name", "file_name"], [True, True]),
-    }
-    by, asc = sort_map[sort_by]
-    filtered = filtered.sort_values(by=by, ascending=asc, kind="stable")
-
-    # Reset pagination whenever the filter set changes.
-    sig = (search_query, tuple(selected_projects), tuple(selected_folders), tuple(selected_types),
-           tuple(selected_revs), status_choice, tuple(extra), sort_by, items_per_page)
-    if st.session_state["filter_sig"] != sig:
-        st.session_state["filter_sig"] = sig
-        st.session_state["page"] = 1
-
-    tab_register, tab_issues, tab_stats = st.tabs(["📋 Register", "⚠️ Issues", "📊 Statistics"])
+    # ---------- Browse tab ----------
+    with tab_browse:
+        render_browse_tab(df, view_mode, items_per_page)
 
     # ---------- Register tab ----------
     with tab_register:
-        total = len(filtered)
-        total_pages = max(1, -(-total // items_per_page))
-        st.session_state["page"] = min(max(1, st.session_state["page"]), total_pages)
+        c1, c2, c3, c4 = st.columns([2.6, 1.5, 1.5, 1.3])
+        with c1:
+            search_query = st.text_input("🔎 Search (e.g. 'GF Lighting', 'E LTG 02', 'Rev 03'):", key="search")
+        with c2:
+            zones = sorted(df["zone"].unique().tolist(), key=lambda z: (z == "Unassigned", z))
+            selected_zones = st.multiselect("🏢 Zone / floor:", options=zones, placeholder="All zones", key="f_zone")
+        with c3:
+            discs = sorted(df["discipline"].unique().tolist(), key=lambda z: (z == "Unassigned", z))
+            selected_discs = st.multiselect("🔌 Discipline:", options=discs, placeholder="All disciplines", key="f_disc")
+        with c4:
+            status_choice = st.selectbox("✅ Status:", options=["Current (latest rev)", "All", "Superseded", "Unclassified"],
+                                         key="status")
 
-        h1, h2, h3, h4 = st.columns([3, 1.4, 1.4, 1.2])
-        h1.markdown(f"**{total:,}** of {len(df):,} files match &nbsp;·&nbsp; page "
-                    f"{st.session_state['page']} / {total_pages}")
-        if total:
+        c5, c6, c7, c8, c9 = st.columns([1.6, 1.8, 1.1, 1.1, 1.6])
+        with c5:
+            projects = sorted(df["project"].unique().tolist())
+            selected_projects = st.multiselect("Project:", options=projects, placeholder="All projects", key="f_proj")
+        with c6:
+            folders = sorted(df["folder_name"].unique().tolist())
+            selected_folders = st.multiselect("Folder:", options=folders, placeholder="All folders", key="f_folder")
+        with c7:
+            types = sorted(df["file_type"].unique().tolist())
+            selected_types = st.multiselect("Type:", options=types, placeholder="All", key="f_type")
+        with c8:
+            revs = sorted(df["revision"].unique().tolist(), key=revision_sort_rank, reverse=True)
+            selected_revs = st.multiselect("Revision:", options=revs, placeholder="All", key="f_rev")
+        with c9:
+            extra = st.multiselect("Flags:", options=["Duplicates only", "Revision conflicts only", "Has issue date"],
+                                   placeholder="None", key="f_flags")
+
+        c10, c11 = st.columns([1.8, 1.8])
+        with c10:
+            group_by = st.selectbox("Group results by:", options=["Zone → Discipline", "Zone", "Discipline", "Folder",
+                                                                 "No grouping (flat list)"], key="group_by")
+        with c11:
+            sort_by = st.selectbox("Sort by:", options=["Drawing No", "Revision (high → low)", "Last modified (newest)",
+                                                        "Issue date (newest)", "File name", "Folder"], key="sort_by")
+
+        filtered = df
+        if selected_projects:
+            filtered = filtered[filtered["project"].isin(selected_projects)]
+        if selected_zones:
+            filtered = filtered[filtered["zone"].isin(selected_zones)]
+        if selected_discs:
+            filtered = filtered[filtered["discipline"].isin(selected_discs)]
+        if selected_folders:
+            filtered = filtered[filtered["folder_name"].isin(selected_folders)]
+        if selected_types:
+            filtered = filtered[filtered["file_type"].isin(selected_types)]
+        if selected_revs:
+            filtered = filtered[filtered["revision"].isin(selected_revs)]
+        if status_choice == "Current (latest rev)":
+            filtered = filtered[filtered["status"] != "Superseded"]
+        elif status_choice == "Superseded":
+            filtered = filtered[filtered["status"] == "Superseded"]
+        elif status_choice == "Unclassified":
+            filtered = filtered[filtered["status"] == "Unclassified"]
+        if "Duplicates only" in extra:
+            filtered = filtered[filtered["is_duplicate"]]
+        if "Revision conflicts only" in extra:
+            filtered = filtered[filtered["is_conflict"]]
+        if "Has issue date" in extra:
+            filtered = filtered[filtered["issue_date"] != NO_DWG]
+        filtered = apply_search(filtered, search_query)
+
+        sort_map = {
+            "Drawing No": (["has_dwg_no", "dwg_no", "rev_tier", "rev_num", "rev_suffix"], [False, True, False, False, False]),
+            "Revision (high → low)": (["rev_tier", "rev_num", "rev_suffix", "dwg_no"], [False, False, False, True]),
+            "Last modified (newest)": (["last_modified"], [False]),
+            "Issue date (newest)": (["issue_date"], [False]),
+            "File name": (["file_name"], [True]),
+            "Folder": (["folder_name", "file_name"], [True, True]),
+        }
+        by, asc = sort_map[sort_by]
+        filtered = filtered.sort_values(by=by, ascending=asc, kind="stable")
+
+        sig = (search_query, tuple(selected_projects), tuple(selected_zones), tuple(selected_discs),
+               tuple(selected_folders), tuple(selected_types), tuple(selected_revs), status_choice,
+               tuple(extra), sort_by, group_by, items_per_page)
+        if st.session_state["filter_sig"] != sig:
+            st.session_state["filter_sig"] = sig
+            for k in [k for k in st.session_state if k.startswith("reg") and k.endswith("_page")]:
+                st.session_state[k] = 1
+
+        h1, h2, h3 = st.columns([4, 1.4, 1.1])
+        h1.markdown(f"**{len(filtered):,}** of {len(df):,} files match")
+        if len(filtered):
             h2.download_button("⬇️ Excel register", data=build_excel_register(filtered),
                                file_name=f"drawing_register_{datetime.now():%Y%m%d_%H%M}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                **WIDE_DL)
-            csv_cols = ["status", "dwg_no", "revision", "title", "file_type", "issue_date", "folder_name",
-                        "file_name", "file_path"]
+            csv_cols = ["status", "dwg_no", "revision", "title", "zone", "discipline", "file_type", "issue_date",
+                        "folder_name", "file_name", "file_path"]
             h3.download_button("⬇️ CSV", data=filtered[csv_cols].to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"drawing_register_{datetime.now():%Y%m%d_%H%M}.csv", mime="text/csv",
                                **WIDE_DL)
-        with h4:
-            new_page = st.number_input("Page", min_value=1, max_value=total_pages,
-                                       value=st.session_state["page"], step=1, label_visibility="collapsed")
-            st.session_state["page"] = int(new_page)
 
-        start = (st.session_state["page"] - 1) * items_per_page
-        page_df = filtered.iloc[start:start + items_per_page]
-
-        if total == 0:
+        group_cols = {"Zone → Discipline": ["zone", "discipline"], "Zone": ["zone"], "Discipline": ["discipline"],
+                      "Folder": ["folder_name"], "No grouping (flat list)": None}[group_by]
+        if filtered.empty:
             st.warning("No files match the current filters.")
-        elif view_mode.startswith("Table"):
-            show_cols = ["status", "dwg_no", "revision", "title", "file_type", "issue_date", "project",
-                         "folder_name", "file_name", "modified", "size_mb", "is_duplicate", "is_conflict",
-                         "file_path"]
-            st.dataframe(
-                page_df[show_cols],
-                hide_index=True,
-                column_config={
-                    "status": st.column_config.TextColumn("Status", width="small"),
-                    "dwg_no": st.column_config.TextColumn("Drawing No", width="medium"),
-                    "revision": st.column_config.TextColumn("Rev", width="small"),
-                    "title": st.column_config.TextColumn("Title", width="large"),
-                    "file_type": st.column_config.TextColumn("Type", width="small"),
-                    "issue_date": st.column_config.TextColumn("Issue date", width="small"),
-                    "project": st.column_config.TextColumn("Project", width="small"),
-                    "folder_name": st.column_config.TextColumn("Folder", width="medium"),
-                    "file_name": st.column_config.TextColumn("File", width="medium"),
-                    "modified": st.column_config.DatetimeColumn("Modified", format="YYYY-MM-DD HH:mm"),
-                    "size_mb": st.column_config.NumberColumn("MB", format="%.2f"),
-                    "is_duplicate": st.column_config.CheckboxColumn("Dup"),
-                    "is_conflict": st.column_config.CheckboxColumn("Conflict"),
-                    "file_path": st.column_config.TextColumn("Path", width="large"),
-                },
-                height=min(900, 42 + 35 * len(page_df)),
-                **WIDE_DF,
-            )
+        elif group_cols:
+            render_grouped(filtered, group_cols, view_mode, "reg", items_per_page)
         else:
-            for row in page_df.itertuples(index=False):
-                with st.container(border=True):
-                    a, b, c, d, e, f, g = st.columns([3.2, 1.6, 0.7, 1.1, 1.1, 2.2, 1.6])
-                    icon = TYPE_ICON.get(row.file_type, "📄")
-                    a.markdown(f"{icon} **{row.title}**")
-                    a.caption(row.file_name)
-                    b.markdown(f"**{row.dwg_no}**")
-                    if row.ref_dwgs:
-                        b.caption(f"refs: {row.ref_dwgs}")
-                    c.markdown(f"Rev **{row.revision}**")
-                    d.markdown(STATUS_BADGE.get(row.status, row.status))
-                    flags = []
-                    if row.is_duplicate:
-                        flags.append("🔁 duplicate")
-                    if row.is_conflict:
-                        flags.append("⚠️ conflict")
-                    if flags:
-                        d.caption(" · ".join(flags))
-                    e.markdown(f"📅 {row.issue_date}")
-                    e.caption(f"{row.size_mb} MB")
-                    f.markdown(f"📍 {row.folder_name}")
-                    f.caption(f"modified {row.modified:%Y-%m-%d %H:%M}" if pd.notna(row.modified) else "")
-                    with g:
-                        b1, b2 = st.columns(2)
-                        if b1.button("📂 Open", key=f"open_{row.id}", help=row.file_path, **WIDE_BTN):
-                            open_file(row.file_path)
-                        if b2.button("🗂️ Folder", key=f"folder_{row.id}", help=os.path.dirname(row.file_path),
-                                     **WIDE_BTN):
-                            open_folder(row.file_path)
-                        with st.popover("Path", **WIDE_BTN):
-                            st.code(row.file_path, language=None)
-
-        if total_pages > 1:
-            p1, p2, p3 = st.columns([1, 6, 1])
-            if p1.button("◀ Previous", disabled=st.session_state["page"] <= 1, **WIDE_BTN):
-                st.session_state["page"] -= 1
-                st.rerun()
-            if p3.button("Next ▶", disabled=st.session_state["page"] >= total_pages, **WIDE_BTN):
-                st.session_state["page"] += 1
-                st.rerun()
+            page = paginate(filtered, items_per_page, "reg_page")
+            render_file_list(page, view_mode, "reg")
 
     # ---------- Issues tab ----------
     with tab_issues:
         no_dwg = df[~df["has_dwg_no"]]
         dups = df[df["is_duplicate"]].sort_values(["fingerprint", "file_path"])
         conflicts = df[df["is_conflict"]].sort_values(["dwg_no", "revision", "file_path"])
-        i1, i2, i3 = st.columns(3)
+        unassigned = df[(df["zone"] == "Unassigned") | (df["discipline"] == "Unassigned")]
+        i1, i2, i3, i4 = st.columns(4)
         i1.metric("Files without drawing number", f"{len(no_dwg):,}")
         i2.metric("Duplicate copies (same content)", f"{len(dups):,}")
         i3.metric("Revision conflicts", f"{len(conflicts):,}",
                   help="Same drawing number and revision, but the file contents differ.")
+        i4.metric("Zone / discipline not detected", f"{len(unassigned):,}")
 
         issue_cols = ["dwg_no", "revision", "file_type", "file_name", "folder_name", "modified", "size_mb", "file_path"]
         with st.expander(f"🔁 Duplicate copies ({len(dups):,})", expanded=bool(len(dups))):
@@ -1117,29 +1330,34 @@ def main() -> None:
                              hide_index=True, **WIDE_DF)
             else:
                 st.caption("Every indexed file has a drawing number.")
+        with st.expander(f"🏷️ Zone or discipline not detected ({len(unassigned):,})"):
+            st.caption("Detected from folder names, file names and titles. Rename the folder "
+                       "(e.g. 'Basement', 'GF', 'Lighting') and re-scan to classify these.")
+            if len(unassigned):
+                st.dataframe(unassigned[["zone", "discipline", "file_name", "folder_name", "file_path"]],
+                             hide_index=True, **WIDE_DF)
 
     # ---------- Statistics tab ----------
     with tab_stats:
         g1, g2 = st.columns(2)
         with g1:
+            st.markdown("**Current drawings per zone**")
+            cur = df[df["status"] == "Current"]
+            st.bar_chart(cur["zone"].value_counts(), horizontal=True)
             st.markdown("**Files per folder (top 25)**")
             st.bar_chart(df["folder_name"].value_counts().head(25), horizontal=True)
         with g2:
+            st.markdown("**Current drawings per discipline**")
+            st.bar_chart(cur["discipline"].value_counts(), horizontal=True)
             st.markdown("**Files per type**")
             st.bar_chart(df["file_type"].value_counts())
-            st.markdown("**Status**")
-            st.bar_chart(df["status"].value_counts())
+        st.markdown("**Zone × Discipline matrix (current drawings)**")
+        matrix = pd.crosstab(cur["zone"], cur["discipline"])
+        st.dataframe(matrix, **WIDE_DF)
         st.markdown("**Revision distribution (drawings with a number)**")
         rev_counts = df.loc[df["has_dwg_no"], "revision"].value_counts()
         rev_counts = rev_counts.reindex(sorted(rev_counts.index, key=revision_sort_rank))
         st.bar_chart(rev_counts)
-        st.markdown("**Latest indexing activity**")
-        st.dataframe(
-            df.sort_values("indexed_at", ascending=False).head(15)[
-                ["indexed_at", "dwg_no", "revision", "file_name", "folder_name", "meta_source"]
-            ],
-            hide_index=True, **WIDE_DF,
-        )
 
 
 if __name__ == "__main__":
