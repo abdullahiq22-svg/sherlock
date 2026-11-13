@@ -1,2 +1,4 @@
 project_drawings_db.sqlite*
 __pycache__/
+.dc_cache/
+Transmittals/
